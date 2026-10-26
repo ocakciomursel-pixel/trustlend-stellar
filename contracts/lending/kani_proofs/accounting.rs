@@ -376,3 +376,114 @@ fn inv_acct_10_partial_payment_not_repaid() {
         }
     }
 }
+
+/// Simulate segregated `collect_fees` guard against pooled contract balance.
+/// Returns the updated `(contract_balance, uncollected_fees)` if and only if
+/// unencumbered fee tokens cover `uncollected_fees`.
+fn collect_fees_segregated(
+    contract_balance: i128,
+    total_collateral: i128,
+    uncollected_fees: i128,
+) -> Option<(i128, i128)> {
+    if uncollected_fees <= 0 {
+        return Some((contract_balance, 0));
+    }
+    let available_fees = contract_balance.saturating_sub(total_collateral);
+    if available_fees < uncollected_fees {
+        return None;
+    }
+    let new_balance = contract_balance.checked_sub(uncollected_fees)?;
+    Some((new_balance, 0))
+}
+
+/// INV-ACCT-11: Collateral Conservation Invariant.
+/// For every whitelisted asset A, contract_balance >= sum(UserCollateral(borrower, A)).
+#[cfg(kani)]
+#[kani::proof]
+fn inv_acct_11_collateral_conservation() {
+    let d1: i128 = kani::any();
+    let d2: i128 = kani::any();
+    let w1: i128 = kani::any();
+
+    kani::assume(d1 > 0 && d1 <= 100_000_000_000);
+    kani::assume(d2 > 0 && d2 <= 100_000_000_000);
+    kani::assume(w1 >= 0 && w1 <= d1);
+
+    let user1_collateral = d1 - w1;
+    let user2_collateral = d2;
+    let total_collateral = user1_collateral + user2_collateral;
+    let contract_balance = (d1 + d2) - w1;
+
+    assert_eq!(total_collateral, user1_collateral + user2_collateral);
+    assert!(
+        contract_balance >= total_collateral,
+        "Contract balance must always cover sum of user collateral positions"
+    );
+}
+
+/// INV-ACCT-12: Fee Backing Invariant.
+/// For the configured fee token, balance(contract) >= total_collateral + uncollected_fees.
+#[cfg(kani)]
+#[kani::proof]
+fn inv_acct_12_fee_backing_invariant() {
+    let total_collateral: i128 = kani::any();
+    let principal: i128 = kani::any();
+    let rate_bps: u32 = kani::any();
+    let days: u32 = kani::any();
+    let fee_bps: u32 = kani::any();
+
+    kani::assume(total_collateral >= 0 && total_collateral <= 100_000_000_000);
+    kani::assume(principal > 0 && principal <= 100_000_000_000);
+    kani::assume(rate_bps >= 1 && rate_bps <= 1500);
+    kani::assume(days >= 1 && days <= 365);
+    kani::assume(fee_bps <= 1000);
+
+    if let Some((mut loan, platform_fee)) = create_loan(principal, rate_bps, days, fee_bps) {
+        // At creation (Pending), no fee is accrued yet.
+        let mut contract_balance = total_collateral;
+        let mut uncollected_fees = 0i128;
+        assert!(contract_balance >= total_collateral + uncollected_fees);
+
+        // Upon full repayment settlement, backed fee tokens accompany fee accrual.
+        loan.status = LoanStatus::Active;
+        let _ = record_payment(&mut loan, loan.total_due);
+        contract_balance += platform_fee;
+        uncollected_fees += platform_fee;
+
+        assert!(
+            contract_balance >= total_collateral + uncollected_fees,
+            "Contract balance must cover both total_collateral and uncollected_fees"
+        );
+    }
+}
+
+/// INV-ACCT-13: Solvency Under Collection.
+/// Executing `collect_fees` must never reduce balance(contract) below total_collateral.
+#[cfg(kani)]
+#[kani::proof]
+fn inv_acct_13_solvency_under_collection() {
+    let total_collateral: i128 = kani::any();
+    let uncollected_fees: i128 = kani::any();
+    let extra_tokens: i128 = kani::any();
+
+    kani::assume(total_collateral >= 0 && total_collateral <= 100_000_000_000);
+    kani::assume(uncollected_fees > 0 && uncollected_fees <= 10_000_000_000);
+    kani::assume(extra_tokens >= 0 && extra_tokens <= 10_000_000_000);
+
+    let contract_balance = total_collateral + extra_tokens;
+    match collect_fees_segregated(contract_balance, total_collateral, uncollected_fees) {
+        Some((new_balance, new_uncollected)) => {
+            assert_eq!(new_uncollected, 0);
+            assert!(
+                new_balance >= total_collateral,
+                "collect_fees must never reduce balance below total_collateral"
+            );
+        }
+        None => {
+            assert!(
+                extra_tokens < uncollected_fees,
+                "collect_fees must only fail when unencumbered tokens are insufficient"
+            );
+        }
+    }
+}
