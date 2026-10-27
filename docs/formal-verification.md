@@ -60,7 +60,7 @@ Formal verification was added to:
 
 #### Collateral Conservation & Backed Fee Accrual Specifications
 
-When the configured fee token $T_{\text{fee}}$ is also a whitelisted collateral asset (such as native XLM), `LendingContract` holds both depositor collateral (`UserCollateral`) and protocol fees (`UncollectedFees`) in a single contract token balance. To prevent fee accrual or collection from encroaching on depositor collateral, the formal verification suite enforces three conservation laws across all loan lifecycles:
+When the configured fee token $T_{\text{fee}}$ is also a whitelisted collateral asset (such as native XLM), `LendingContract` holds both depositor collateral (`UserCollateral`) and protocol fees (`UncollectedFees`) in a single contract token balance. To prevent fee accrual or collection from encroaching on depositor collateral, this change specifies three desired conservation laws. The added Kani harnesses and property tests verify standalone reference models; they do not invoke or establish enforcement by production `LendingContract`.
 
 1. **Collateral Conservation Invariant (`INV-ACCT-11`):**
    For every whitelisted asset $A$:
@@ -71,7 +71,11 @@ When the configured fee token $T_{\text{fee}}$ is also a whitelisted collateral 
    $$\text{balance}(\text{LendingContract}, T_{\text{fee}}) \ge \text{TotalCollateral}(T_{\text{fee}}) + \text{UncollectedFees}$$
 
 3. **Solvency Under Collection (`INV-ACCT-13`):**
-   Executing `collect_fees` requires $\text{balance}(\text{LendingContract}, T_{\text{fee}}) - \text{TotalCollateral}(T_{\text{fee}}) \ge \text{UncollectedFees}$ and must never reduce $\text{balance}(\text{LendingContract}, A)$ below $\text{TotalCollateral}(A)$ for any asset.
+   The proposed reference-model `collect_fees` guard requires $\text{balance}(\text{LendingContract}, T_{\text{fee}}) - \text{TotalCollateral}(T_{\text{fee}}) \ge \text{UncollectedFees}$ and must never reduce $\text{balance}(\text{LendingContract}, A)$ below $\text{TotalCollateral}(A)$ for any asset.
+
+**Coverage boundary:** `ConservationVault` delays fee accrual until modeled settlement, credits the corresponding tokens, and applies a collateral-aware collection guard. Production `create_loan_request` currently accrues `UncollectedFees` without the matching inflow, `record_payment` updates loan/payment records, and `collect_fees` checks the fee-token balance rather than subtracting collateral. These tests do not prove production solvency or implement that separate accounting change. INV-ACCT-11 through INV-ACCT-13 remain specifications for production until real-contract integration tests and the corresponding implementation are added.
+
+The new negative controls independently vary token inflow and fee liability and remove collateral tokens to ensure the reference-model checks detect underfunding. Kani settlement also receives an independent inflow and rejects unbacked accrual rather than assuming matching funds.
 
 ### State Machine (10 invariants)
 

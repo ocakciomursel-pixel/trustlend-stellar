@@ -396,33 +396,59 @@ fn collect_fees_segregated(
     Some((new_balance, 0))
 }
 
-/// INV-ACCT-11: Collateral Conservation Invariant.
-/// For every whitelisted asset A, contract_balance >= sum(UserCollateral(borrower, A)).
+/// Reference-model collateral withdrawal; no LendingContract code executes here.
+fn withdraw_backed_collateral(
+    balance: i128,
+    collateral: i128,
+    amount: i128,
+) -> Option<(i128, i128)> {
+    if amount < 0 || amount > collateral || amount > balance {
+        return None;
+    }
+    Some((balance - amount, collateral - amount))
+}
+
+/// Reference-model fee settlement with independently supplied token inflow.
+/// Rejects fee accrual that would create an unbacked liability.
+fn settle_backed_fee(
+    balance: i128,
+    collateral: i128,
+    fees: i128,
+    inflow: i128,
+    fee: i128,
+) -> Option<(i128, i128)> {
+    if inflow < 0 || fee < 0 {
+        return None;
+    }
+    let next_balance = balance.checked_add(inflow)?;
+    let next_fees = fees.checked_add(fee)?;
+    if next_balance < collateral.checked_add(next_fees)? {
+        return None;
+    }
+    Some((next_balance, next_fees))
+}
+
+/// INV-ACCT-11 for the reference withdrawal model, not production enforcement.
 #[cfg(kani)]
 #[kani::proof]
 fn inv_acct_11_collateral_conservation() {
-    let d1: i128 = kani::any();
-    let d2: i128 = kani::any();
-    let w1: i128 = kani::any();
-
-    kani::assume(d1 > 0 && d1 <= 100_000_000_000);
-    kani::assume(d2 > 0 && d2 <= 100_000_000_000);
-    kani::assume(w1 >= 0 && w1 <= d1);
-
-    let user1_collateral = d1 - w1;
-    let user2_collateral = d2;
-    let total_collateral = user1_collateral + user2_collateral;
-    let contract_balance = (d1 + d2) - w1;
-
-    assert_eq!(total_collateral, user1_collateral + user2_collateral);
-    assert!(
-        contract_balance >= total_collateral,
-        "Contract balance must always cover sum of user collateral positions"
-    );
+    let collateral: i128 = kani::any();
+    let balance: i128 = kani::any();
+    let withdrawal: i128 = kani::any();
+    kani::assume(collateral >= 0 && collateral <= 100_000_000_000);
+    kani::assume(balance >= collateral && balance <= 200_000_000_000);
+    kani::assume(withdrawal >= 0 && withdrawal <= 200_000_000_000);
+    match withdraw_backed_collateral(balance, collateral, withdrawal) {
+        Some((next_balance, next_collateral)) => {
+            assert_eq!(next_balance, balance - withdrawal);
+            assert_eq!(next_collateral, collateral - withdrawal);
+            assert!(next_balance >= next_collateral);
+        }
+        None => assert!(withdrawal > collateral),
+    }
 }
 
-/// INV-ACCT-12: Fee Backing Invariant.
-/// For the configured fee token, balance(contract) >= total_collateral + uncollected_fees.
+/// INV-ACCT-12 for a proposed settlement model, not production enforcement.
 #[cfg(kani)]
 #[kani::proof]
 fn inv_acct_12_fee_backing_invariant() {
@@ -431,34 +457,38 @@ fn inv_acct_12_fee_backing_invariant() {
     let rate_bps: u32 = kani::any();
     let days: u32 = kani::any();
     let fee_bps: u32 = kani::any();
+    let inflow: i128 = kani::any();
 
     kani::assume(total_collateral >= 0 && total_collateral <= 100_000_000_000);
     kani::assume(principal > 0 && principal <= 100_000_000_000);
     kani::assume(rate_bps >= 1 && rate_bps <= 1500);
     kani::assume(days >= 1 && days <= 365);
     kani::assume(fee_bps <= 1000);
+    kani::assume(inflow >= 0 && inflow <= 100_000_000_000);
 
     if let Some((mut loan, platform_fee)) = create_loan(principal, rate_bps, days, fee_bps) {
-        // At creation (Pending), no fee is accrued yet.
-        let mut contract_balance = total_collateral;
-        let mut uncollected_fees = 0i128;
-        assert!(contract_balance >= total_collateral + uncollected_fees);
-
-        // Upon full repayment settlement, backed fee tokens accompany fee accrual.
         loan.status = LoanStatus::Active;
-        let _ = record_payment(&mut loan, loan.total_due);
-        contract_balance += platform_fee;
-        uncollected_fees += platform_fee;
-
-        assert!(
-            contract_balance >= total_collateral + uncollected_fees,
-            "Contract balance must cover both total_collateral and uncollected_fees"
+        let total_due = loan.total_due;
+        let applied = record_payment(&mut loan, total_due).expect("active loan accepts repayment");
+        assert_eq!(applied, total_due);
+        assert_eq!(loan.status, LoanStatus::Repaid);
+        let interest_paid = applied - principal;
+        assert_eq!(
+            platform_fee,
+            calculate_platform_fee(interest_paid, fee_bps).unwrap()
         );
+        match settle_backed_fee(total_collateral, total_collateral, 0, inflow, platform_fee) {
+            Some((balance, fees)) => {
+                assert_eq!(fees, platform_fee);
+                assert_eq!(balance, total_collateral + inflow);
+                assert!(balance >= total_collateral + fees);
+            }
+            None => assert!(inflow < platform_fee),
+        }
     }
 }
 
-/// INV-ACCT-13: Solvency Under Collection.
-/// Executing `collect_fees` must never reduce balance(contract) below total_collateral.
+/// INV-ACCT-13 for collect_fees_segregated, not LendingContract::collect_fees.
 #[cfg(kani)]
 #[kani::proof]
 fn inv_acct_13_solvency_under_collection() {
@@ -485,5 +515,47 @@ fn inv_acct_13_solvency_under_collection() {
                 "collect_fees must only fail when unencumbered tokens are insufficient"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reference_model_tests {
+    use super::*;
+
+    #[test]
+    fn fee_settlement_rejects_independently_underfunded_inflow() {
+        assert_eq!(settle_backed_fee(100, 100, 0, 0, 10), None);
+        assert_eq!(settle_backed_fee(100, 100, 0, 9, 10), None);
+        assert_eq!(settle_backed_fee(100, 100, 0, 10, 10), Some((110, 10)));
+        assert_eq!(settle_backed_fee(110, 100, 10, 4, 5), None);
+        assert_eq!(settle_backed_fee(110, 100, 10, 6, 5), Some((116, 15)));
+    }
+
+    #[test]
+    fn collateral_withdrawal_preserves_surplus_and_rejects_excess() {
+        assert_eq!(withdraw_backed_collateral(120, 100, 40), Some((80, 60)));
+        assert_eq!(withdraw_backed_collateral(120, 100, 101), None);
+        assert_eq!(withdraw_backed_collateral(120, 100, -1), None);
+    }
+
+    #[test]
+    fn collection_guard_preserves_collateral_and_failed_state() {
+        assert_eq!(collect_fees_segregated(109, 100, 10), None);
+        assert_eq!(collect_fees_segregated(110, 100, 10), Some((100, 0)));
+        assert_eq!(collect_fees_segregated(120, 100, 10), Some((110, 0)));
+    }
+
+    #[test]
+    fn settlement_fee_is_tied_to_applied_payment() {
+        let (mut loan, fee) = create_loan(100_000, 1000, 365, 1000).unwrap();
+        loan.status = LoanStatus::Active;
+        let due = loan.total_due;
+        let applied = record_payment(&mut loan, due + 1).unwrap();
+        assert_eq!(applied, due);
+        assert_eq!(loan.status, LoanStatus::Repaid);
+        assert_eq!(
+            fee,
+            calculate_platform_fee(applied - loan.amount, 1000).unwrap()
+        );
     }
 }

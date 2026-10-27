@@ -1,4 +1,5 @@
-//! Property-based tests for the TrustLend lending contract.
+//! Property-based tests for TrustLend arithmetic and standalone reference models.
+//! The conservation model does not invoke LendingContract production code.
 //!
 //! These tests use the `proptest` crate to fuzz-test mathematical and
 //! accounting invariants with randomly generated inputs. Unlike Kani
@@ -395,7 +396,7 @@ impl ConservationVault {
         Ok(())
     }
 
-    /// Mirror `deposit_collateral`: transfers collateral tokens into contract custody
+    /// Model `deposit_collateral`: transfers collateral tokens into contract custody
     /// and increments both `UserCollateral(borrower)` and `TotalCollateral(asset)`.
     fn deposit_collateral(&mut self, borrower: usize, amount: i128) {
         if amount <= 0 {
@@ -406,7 +407,7 @@ impl ConservationVault {
         self.contract_balance += amount;
     }
 
-    /// Mirror `withdraw_collateral`: decrements `UserCollateral(borrower)` and
+    /// Model `withdraw_collateral`: decrements `UserCollateral(borrower)` and
     /// `TotalCollateral(asset)` and transfers collateral tokens back to the borrower.
     fn withdraw_collateral(&mut self, borrower: usize, amount: i128) -> Result<(), &'static str> {
         if amount <= 0 || self.user_collateral[borrower] < amount {
@@ -418,7 +419,7 @@ impl ConservationVault {
         Ok(())
     }
 
-    /// Mirror `create_loan_request`: computes scheduled interest and platform fee
+    /// Proposed `create_loan_request`: computes scheduled interest and platform fee
     /// without crediting `UncollectedFees` upfront.
     fn create_loan_request(
         &mut self,
@@ -442,35 +443,35 @@ impl ConservationVault {
         idx
     }
 
-    /// Mirror `approve_loan`.
+    /// Model `approve_loan`.
     fn approve_loan(&mut self, loan_idx: usize) {
         if self.loans[loan_idx].status == LifecycleStatus::Pending {
             self.loans[loan_idx].status = LifecycleStatus::Approved;
         }
     }
 
-    /// Mirror `revoke_approval`.
+    /// Model `revoke_approval`.
     fn revoke_approval(&mut self, loan_idx: usize) {
         if self.loans[loan_idx].status == LifecycleStatus::Approved {
             self.loans[loan_idx].status = LifecycleStatus::Pending;
         }
     }
 
-    /// Mirror `cancel_loan_request`.
+    /// Model `cancel_loan_request`.
     fn cancel_loan(&mut self, loan_idx: usize) {
         if self.loans[loan_idx].status == LifecycleStatus::Pending {
             self.loans[loan_idx].status = LifecycleStatus::Cancelled;
         }
     }
 
-    /// Mirror `activate_loan`.
+    /// Model `activate_loan`.
     fn activate_loan(&mut self, loan_idx: usize) {
         if self.loans[loan_idx].status == LifecycleStatus::Approved {
             self.loans[loan_idx].status = LifecycleStatus::Active;
         }
     }
 
-    /// Mirror `switch_rate_model` on an active loan.
+    /// Model `switch_rate_model` on an active loan.
     fn switch_rate_model(&mut self, loan_idx: usize) {
         let loan = &mut self.loans[loan_idx];
         if loan.status == LifecycleStatus::Active {
@@ -480,14 +481,14 @@ impl ConservationVault {
         }
     }
 
-    /// Mirror `mark_defaulted` on an active loan.
+    /// Model `mark_defaulted` on an active loan.
     fn mark_defaulted(&mut self, loan_idx: usize) {
         if self.loans[loan_idx].status == LifecycleStatus::Active {
             self.loans[loan_idx].status = LifecycleStatus::Defaulted;
         }
     }
 
-    /// Mirror `record_payment` with backed fee settlement: accrues protocol fees
+    /// Proposed `record_payment` with backed fee settlement: accrues protocol fees
     /// only as interest above principal is settled, accompanied by the fee token inflow.
     fn record_payment(&mut self, loan_idx: usize, amount: i128) {
         let loan = &mut self.loans[loan_idx];
@@ -520,7 +521,7 @@ impl ConservationVault {
         }
     }
 
-    /// Mirror `collect_fees` with segregated collateral balance guard.
+    /// Proposed `collect_fees` with a collateral-aware guard absent from production.
     fn collect_fees(&mut self) -> Result<i128, &'static str> {
         if self.uncollected_fees <= 0 {
             return Ok(0);
@@ -541,7 +542,7 @@ proptest! {
     /// Across arbitrary multi-borrower deposits and withdrawals, the contract's
     /// token balance is always >= the sum of all borrowers' collateral positions.
     #[test]
-    fn prop_collateral_conservation_invariant(
+    fn prop_reference_model_collateral_conservation_invariant(
         d1 in 1i128..=100_000_000_000i128,
         d2 in 1i128..=100_000_000_000i128,
         d3 in 1i128..=100_000_000_000i128,
@@ -573,7 +574,7 @@ proptest! {
     /// activation, rate switch, partial repayments, full repayment, cancellation,
     /// default, fee collection, and collateral withdrawal.
     #[test]
-    fn prop_fee_backing_invariant_across_all_loan_lifecycles(
+    fn prop_reference_model_fee_backing_across_loan_lifecycles(
         collateral in 10_000_000i128..=100_000_000_000i128,
         principal in arb_principal(),
         rate_bps in arb_rate_bps(),
@@ -664,7 +665,7 @@ proptest! {
     /// Executing `collect_fees` never reduces `balance(contract)` below
     /// `total_collateral`, and rejects collection if fees are unbacked.
     #[test]
-    fn prop_solvency_under_collection(
+    fn prop_reference_model_solvency_under_collection(
         collateral in 1i128..=100_000_000_000i128,
         uncollected_fees in 1i128..=10_000_000_000i128,
         backed_fee_tokens in 0i128..=10_000_000_000i128,
@@ -691,5 +692,35 @@ proptest! {
             prop_assert_eq!(vault.contract_balance, collateral + backed_fee_tokens);
             prop_assert!(vault.contract_balance >= vault.total_collateral);
         }
+    }
+}
+
+proptest! {
+    /// Independent cash inflow and liability expose underfunding instead of
+    /// assuming that every accrued fee arrives with matching tokens.
+    #[test]
+    fn prop_reference_model_detects_unbacked_fee_accrual(
+        collateral in 1i128..=100_000_000_000i128,
+        token_inflow in 0i128..=10_000_000_000i128,
+        fee_liability in 1i128..=10_000_000_000i128,
+    ) {
+        let mut vault = ConservationVault::new(1);
+        vault.deposit_collateral(0, collateral);
+        vault.contract_balance += token_inflow;
+        vault.uncollected_fees = fee_liability;
+        prop_assert_eq!(vault.check_invariants().is_ok(), token_inflow >= fee_liability);
+    }
+
+    /// Negative control: an unrecorded token outflow must be detected.
+    #[test]
+    fn prop_reference_model_detects_collateral_token_loss(
+        collateral in 1i128..=100_000_000_000i128,
+        loss_ratio in 1i128..=10_000i128,
+    ) {
+        let mut vault = ConservationVault::new(1);
+        vault.deposit_collateral(0, collateral);
+        let loss = (collateral * loss_ratio / 10_000).max(1);
+        vault.contract_balance -= loss;
+        prop_assert!(vault.check_invariants().is_err());
     }
 }
